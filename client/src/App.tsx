@@ -17,12 +17,13 @@ import {
   Tool,
   LoggingLevel,
 } from "@modelcontextprotocol/sdk/types.js";
-import React, {
+import {
   Suspense,
   useCallback,
   useEffect,
   useRef,
   useState,
+  lazy,
 } from "react";
 import { useConnection } from "./lib/hooks/useConnection";
 import { useDraggablePane } from "./lib/hooks/useDraggablePane";
@@ -82,13 +83,14 @@ const App = () => {
     return localStorage.getItem("lastSseUrl") || "http://localhost:3001/sse";
   });
   const [transportType, setTransportType] = useState<
-    "stdio" | "sse" | "streamable-http"
+    "stdio" | "sse" | "streamable-http" | "intra-browser"
   >(() => {
     return (
       (localStorage.getItem("lastTransportType") as
         | "stdio"
         | "sse"
-        | "streamable-http") || "stdio"
+        | "streamable-http"
+        | "intra-browser") || "stdio"
     );
   });
   const [logLevel, setLogLevel] = useState<LoggingLevel>("debug");
@@ -162,6 +164,12 @@ const App = () => {
 
   const { height: historyPaneHeight, handleDragStart } = useDraggablePane(300);
 
+  const [intraBrowserOrigin, setIntraBrowserOrigin] = useState<string>("");
+  const intraBrowserTargetRef = useRef<HTMLIFrameElement | null>(null);
+  const [intraBrowserWindow, setIntraBrowserWindow] = useState<Window | null>(
+    null,
+  );
+
   const {
     connectionStatus,
     serverCapabilities,
@@ -179,8 +187,6 @@ const App = () => {
     args,
     sseUrl,
     env,
-    bearerToken,
-    headerName,
     config,
     onNotification: (notification) => {
       setNotifications((prev) => [...prev, notification as ServerNotification]);
@@ -197,7 +203,8 @@ const App = () => {
         { id: nextRequestId.current++, request, resolve, reject },
       ]);
     },
-    getRoots: () => rootsRef.current,
+    targetWindow: intraBrowserWindow || undefined,
+    targetOrigin: intraBrowserOrigin,
   });
 
   useEffect(() => {
@@ -228,7 +235,6 @@ const App = () => {
     localStorage.setItem(CONFIG_LOCAL_STORAGE_KEY, JSON.stringify(config));
   }, [config]);
 
-  // Auto-connect to previously saved serverURL after OAuth callback
   const onOAuthConnect = useCallback(
     (serverUrl: string) => {
       setSseUrl(serverUrl);
@@ -253,7 +259,6 @@ const App = () => {
       .catch((error) =>
         console.error("Error fetching default environment:", error),
       );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -471,8 +476,125 @@ const App = () => {
     setStdErrNotifications([]);
   };
 
+  // Disconnect handler that tears down the intra-browser iframe completely
+  const handleDisconnect = useCallback(async () => {
+    // For intra-browser: clear window reference and remove iframe *before* we signal disconnect
+    if (transportType === "intra-browser") {
+      // Clear the stored window reference immediately to prevent auto-reconnect race
+      setIntraBrowserWindow(null);
+
+      if (intraBrowserTargetRef.current && intraBrowserTargetRef.current.parentNode) {
+        console.log("[App] Removing intra-browser iframe on disconnect");
+        intraBrowserTargetRef.current.parentNode.removeChild(intraBrowserTargetRef.current);
+        intraBrowserTargetRef.current = null;
+      }
+    }
+
+    // Now close the MCP client/transport
+    await disconnectMcpServer();
+  }, [disconnectMcpServer, transportType]);
+
+  const handleIntraBrowserConnect = useCallback((src: string, origin: string) => {
+    setIntraBrowserOrigin(origin);
+    
+    // Track if we need to wait for iframe load
+    let needToWaitForLoad = false;
+    
+    // Create a new iframe element if it doesn't exist
+    if (!intraBrowserTargetRef.current) {
+      console.log("[App] Creating new iframe for IntraBrowser transport");
+      
+      const iframe = document.createElement('iframe');
+      iframe.style.width = '0';
+      iframe.style.height = '0';
+      iframe.style.border = 'none';
+      iframe.style.position = 'absolute';
+      iframe.style.opacity = '0';
+      
+      // Important: Store the iframe reference BEFORE setting src
+      // This ensures the reference is available when onload fires
+      intraBrowserTargetRef.current = iframe;
+      document.body.appendChild(iframe);
+      
+      needToWaitForLoad = true;
+      
+      // Set the onload handler before setting src to avoid race conditions
+      iframe.onload = () => {
+        console.log("[App] Iframe loaded, now connecting...");
+        // Add a short delay to ensure DOM is fully ready
+        setTimeout(() => {
+          if (intraBrowserTargetRef.current?.contentWindow) {
+            console.log("[App] Iframe contentWindow available, storing window reference");
+            setIntraBrowserWindow(intraBrowserTargetRef.current.contentWindow);
+          } else {
+            console.error("[App] Iframe contentWindow not available after load!");
+          }
+        }, 100);
+      };
+      
+      // Set src last to avoid missing the load event
+      iframe.src = src;
+    } else {
+      // Only update src if it has changed to avoid reload
+      const iframe = intraBrowserTargetRef.current;
+      if (iframe.src !== src) {
+        console.log("[App] Updating iframe src (will cause reload)");
+        
+        // Set the onload handler before changing src
+        iframe.onload = () => {
+          console.log("[App] Iframe reloaded, now connecting...");
+          // Add a short delay to ensure DOM is fully ready
+          setTimeout(() => {
+            if (intraBrowserTargetRef.current?.contentWindow) {
+              console.log("[App] Iframe contentWindow available after reload, storing window reference");
+              setIntraBrowserWindow(intraBrowserTargetRef.current.contentWindow);
+            } else {
+              console.error("[App] Iframe contentWindow not available after reload!");
+            }
+          }, 100);
+        };
+        
+        needToWaitForLoad = true;
+        iframe.src = src;
+      } else {
+        console.log("[App] Reusing existing iframe with same src");
+        needToWaitForLoad = false;
+      }
+    }
+    
+    // Connect immediately if we don't need to wait for load
+    if (!needToWaitForLoad) {
+      console.log("[App] Iframe already loaded, connecting immediately");
+      if (intraBrowserTargetRef.current?.contentWindow) {
+        setIntraBrowserWindow(intraBrowserTargetRef.current.contentWindow);
+      } else {
+        console.error("[App] Iframe exists but contentWindow is not available!");
+      }
+    }
+  }, [connectMcpServer]);
+
+  // Automatically connect once the iframe window reference is ready and we are disconnected
+  useEffect(() => {
+    if (
+      transportType === "intra-browser" &&
+      intraBrowserWindow &&
+      connectionStatus === "disconnected"
+    ) {
+      console.log("[App] Detected ready iframe window, initiating connection...");
+      connectMcpServer();
+    }
+  }, [transportType, intraBrowserWindow, connectionStatus, connectMcpServer]);
+
+  useEffect(() => {
+    return () => {
+      if (intraBrowserTargetRef.current && intraBrowserTargetRef.current.parentNode) {
+        intraBrowserTargetRef.current.parentNode.removeChild(intraBrowserTargetRef.current);
+      }
+    };
+  }, []);
+
   if (window.location.pathname === "/oauth/callback") {
-    const OAuthCallback = React.lazy(
+    const OAuthCallback = lazy(
       () => import("./components/OAuthCallback"),
     );
     return (
@@ -503,12 +625,13 @@ const App = () => {
         headerName={headerName}
         setHeaderName={setHeaderName}
         onConnect={connectMcpServer}
-        onDisconnect={disconnectMcpServer}
+        onDisconnect={handleDisconnect}
         stdErrNotifications={stdErrNotifications}
         logLevel={logLevel}
         sendLogLevelRequest={sendLogLevelRequest}
         loggingSupported={!!serverCapabilities?.logging || false}
         clearStdErrNotifications={clearStdErrNotifications}
+        onIntraBrowserConnect={handleIntraBrowserConnect}
       />
       <div className="flex-1 flex flex-col overflow-hidden">
         <div className="flex-1 overflow-auto">

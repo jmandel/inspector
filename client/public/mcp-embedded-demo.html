@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP IntraBrowserTransport Demo</title>
+  <script type="module">
+    // Import the IntraBrowserServerTransport directly from source
+    import { IntraBrowserServerTransport } from '../src/lib/transports/IntraBrowserTransport.js';
+
+    document.addEventListener('DOMContentLoaded', () => {
+      /* ------------------------------------------------------------- */
+      /*  Helper for pretty logging to page & console                  */
+      /* ------------------------------------------------------------- */
+      const logEl = document.getElementById('log');
+      const log = (msg) => {
+        console.log(msg);
+        const div = document.createElement('div');
+        div.textContent = `${new Date().toISOString()}: ${msg}`;
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+
+      /* ------------------------------------------------------------- */
+      /*  Create transport and wait for server_ready                   */
+      /* ------------------------------------------------------------- */
+      log('Creating IntraBrowserServerTransport…');
+      const transport = new IntraBrowserServerTransport('*'); // ⚠️ lock down origin in prod
+
+      transport.onmessage = async (msg) => {
+        log(`RX → ${JSON.stringify(msg)}`);
+
+        // Handle initialize
+        if (msg.method === 'initialize') {
+          await transport.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              protocolVersion: '2024-11-05',
+              capabilities: { tools: {}, resources: {} },
+              serverInfo: { name: 'embedded-demo-server', version: '1.0.0' },
+            },
+          });
+          return;
+        }
+
+        // Handle ping
+        if (msg.method === 'ping') {
+          await transport.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+          return;
+        }
+
+        // Handle a tiny demo method: resources/list
+        if (msg.method === 'resources/list') {
+          await transport.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              resources: [
+                { uri: 'resource:demo1', name: 'Demo 1', description: 'A demo resource' },
+                { uri: 'resource:demo2', name: 'Demo 2', description: 'Another demo resource' },
+              ],
+            },
+          });
+          return;
+        }
+
+        // Unknown method
+        await transport.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: { code: -32601, message: `Unknown method ${msg.method}` },
+        });
+      };
+
+      // Start (will emit server_ready automatically)
+      transport
+        .start()
+        .then(() => log('Transport started – waiting for requests…'))
+        .catch((err) => log(`Transport start failed: ${err.message}`));
+    });
+  </script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0;
+      padding: 20px;
+    }
+    h1 {
+      margin-top: 0;
+    }
+    #log {
+      background-color: #f5f5f5;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 10px;
+      height: 300px;
+      overflow-y: auto;
+      font-family: monospace;
+      margin-top: 20px;
+    }
+    #log div {
+      margin-bottom: 5px;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 5px;
+    }
+  </style>
+</head>
+<body>
+  <h1>MCP IntraBrowserTransport Demo</h1>
+  <p>This page implements an MCP server using the IntraBrowserServerTransport.</p>
+  <p>Connect to this page from the MCP Inspector using the "IntraBrowserTransport" option.</p>
+  
+  <div id="log"></div>
+</body>
+</html> 

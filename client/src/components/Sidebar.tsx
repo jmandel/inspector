@@ -36,11 +36,12 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from "@/components/ui/tooltip";
+import { IntraBrowserConfigPanel } from "./Sidebar/IntraBrowserConfigPanel";
 
 interface SidebarProps {
   connectionStatus: ConnectionStatus;
-  transportType: "stdio" | "sse" | "streamable-http";
-  setTransportType: (type: "stdio" | "sse" | "streamable-http") => void;
+  transportType: "stdio" | "sse" | "streamable-http" | "intra-browser";
+  setTransportType: (type: "stdio" | "sse" | "streamable-http" | "intra-browser") => void;
   command: string;
   setCommand: (command: string) => void;
   args: string;
@@ -62,6 +63,8 @@ interface SidebarProps {
   loggingSupported: boolean;
   config: InspectorConfig;
   setConfig: (config: InspectorConfig) => void;
+  // For intra-browser transport
+  onIntraBrowserConnect?: (targetUrl: string, targetOrigin: string) => void;
 }
 
 const Sidebar = ({
@@ -89,12 +92,47 @@ const Sidebar = ({
   loggingSupported,
   config,
   setConfig,
+  onIntraBrowserConnect,
 }: SidebarProps) => {
   const [theme, setTheme] = useTheme();
   const [showEnvVars, setShowEnvVars] = useState(false);
   const [showBearerToken, setShowBearerToken] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
   const [shownEnvVars, setShownEnvVars] = useState<Set<string>>(new Set());
+
+  const connect = () => {
+    const isConnected = connectionStatus === "connected";
+    if (isConnected) {
+      onDisconnect();
+      return;
+    }
+
+    // For IntraBrowserTransport, use the globally registered connect handler
+    if (transportType === "intra-browser") {
+      if (window.MCP_INSPECTOR_API?.connectIntraBrowserTransport) {
+        window.MCP_INSPECTOR_API.connectIntraBrowserTransport();
+      } else {
+        console.error("IntraBrowserTransport connect handler not registered");
+      }
+      return;
+    }
+
+    // For other transport types, use the onConnect prop directly
+    onConnect();
+  };
+
+  // At the bottom of the sidebar, add logic to handle the Connect button text
+  const getConnectButtonText = () => {
+    if (connectionStatus === "connected") {
+      return "Reconnect";
+    }
+    
+    if (transportType === "intra-browser") {
+      return "Connect to IntraBrowserTransport";
+    }
+    
+    return "Connect";
+  };
 
   return (
     <div className="w-80 bg-card border-r border-border flex flex-col h-full">
@@ -117,7 +155,7 @@ const Sidebar = ({
             </label>
             <Select
               value={transportType}
-              onValueChange={(value: "stdio" | "sse" | "streamable-http") =>
+              onValueChange={(value: "stdio" | "sse" | "streamable-http" | "intra-browser") =>
                 setTransportType(value)
               }
             >
@@ -128,101 +166,121 @@ const Sidebar = ({
                 <SelectItem value="stdio">STDIO</SelectItem>
                 <SelectItem value="sse">SSE</SelectItem>
                 <SelectItem value="streamable-http">Streamable HTTP</SelectItem>
+                <SelectItem value="intra-browser">IntraBrowserTransport</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
-          {transportType === "stdio" ? (
-            <>
-              <div className="space-y-2">
-                <label className="text-sm font-medium" htmlFor="command-input">
-                  Command
-                </label>
-                <Input
-                  id="command-input"
-                  placeholder="Command"
-                  value={command}
-                  onChange={(e) => setCommand(e.target.value)}
-                  className="font-mono"
+          {(() => {
+            const isConnected = connectionStatus === "connected";
+            
+            if (transportType === "intra-browser") {
+              return (
+                <IntraBrowserConfigPanel 
+                  onConnect={(targetUrl, targetOrigin) => 
+                    onIntraBrowserConnect && onIntraBrowserConnect(targetUrl, targetOrigin)
+                  }
+                  onDisconnect={onDisconnect}
+                  isConnected={isConnected}
+                  isConnecting={false}
                 />
-              </div>
-              <div className="space-y-2">
-                <label
-                  className="text-sm font-medium"
-                  htmlFor="arguments-input"
-                >
-                  Arguments
-                </label>
-                <Input
-                  id="arguments-input"
-                  placeholder="Arguments (space-separated)"
-                  value={args}
-                  onChange={(e) => setArgs(e.target.value)}
-                  className="font-mono"
-                />
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="space-y-2">
-                <label className="text-sm font-medium" htmlFor="sse-url-input">
-                  URL
-                </label>
-                <Input
-                  id="sse-url-input"
-                  placeholder="URL"
-                  value={sseUrl}
-                  onChange={(e) => setSseUrl(e.target.value)}
-                  className="font-mono"
-                />
-              </div>
-              <div className="space-y-2">
-                <Button
-                  variant="outline"
-                  onClick={() => setShowBearerToken(!showBearerToken)}
-                  className="flex items-center w-full"
-                  data-testid="auth-button"
-                  aria-expanded={showBearerToken}
-                >
-                  {showBearerToken ? (
-                    <ChevronDown className="w-4 h-4 mr-2" />
-                  ) : (
-                    <ChevronRight className="w-4 h-4 mr-2" />
-                  )}
-                  Authentication
-                </Button>
-                {showBearerToken && (
+              );
+            } else if (transportType === "stdio") {
+              return (
+                <>
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Header Name</label>
-                    <Input
-                      placeholder="Authorization"
-                      onChange={(e) =>
-                        setHeaderName && setHeaderName(e.target.value)
-                      }
-                      data-testid="header-input"
-                      className="font-mono"
-                      value={headerName}
-                    />
-                    <label
-                      className="text-sm font-medium"
-                      htmlFor="bearer-token-input"
-                    >
-                      Bearer Token
+                    <label className="text-sm font-medium" htmlFor="command-input">
+                      Command
                     </label>
                     <Input
-                      id="bearer-token-input"
-                      placeholder="Bearer Token"
-                      value={bearerToken}
-                      onChange={(e) => setBearerToken(e.target.value)}
-                      data-testid="bearer-token-input"
+                      id="command-input"
+                      placeholder="Command"
+                      value={command}
+                      onChange={(e) => setCommand(e.target.value)}
                       className="font-mono"
-                      type="password"
                     />
                   </div>
-                )}
-              </div>
-            </>
-          )}
+                  <div className="space-y-2">
+                    <label
+                      className="text-sm font-medium"
+                      htmlFor="arguments-input"
+                    >
+                      Arguments
+                    </label>
+                    <Input
+                      id="arguments-input"
+                      placeholder="Arguments (space-separated)"
+                      value={args}
+                      onChange={(e) => setArgs(e.target.value)}
+                      className="font-mono"
+                    />
+                  </div>
+                </>
+              );
+            } else {
+              return (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="sse-url-input">
+                      URL
+                    </label>
+                    <Input
+                      id="sse-url-input"
+                      placeholder="URL"
+                      value={sseUrl}
+                      onChange={(e) => setSseUrl(e.target.value)}
+                      className="font-mono"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Button
+                      variant="outline"
+                      onClick={() => setShowBearerToken(!showBearerToken)}
+                      className="flex items-center w-full"
+                      data-testid="auth-button"
+                      aria-expanded={showBearerToken}
+                    >
+                      {showBearerToken ? (
+                        <ChevronDown className="w-4 h-4 mr-2" />
+                      ) : (
+                        <ChevronRight className="w-4 h-4 mr-2" />
+                      )}
+                      Authentication
+                    </Button>
+                    {showBearerToken && (
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">Header Name</label>
+                        <Input
+                          placeholder="Authorization"
+                          onChange={(e) =>
+                            setHeaderName && setHeaderName(e.target.value)
+                          }
+                          data-testid="header-input"
+                          className="font-mono"
+                          value={headerName}
+                        />
+                        <label
+                          className="text-sm font-medium"
+                          htmlFor="bearer-token-input"
+                        >
+                          Bearer Token
+                        </label>
+                        <Input
+                          id="bearer-token-input"
+                          placeholder="Bearer Token"
+                          value={bearerToken}
+                          onChange={(e) => setBearerToken(e.target.value)}
+                          data-testid="bearer-token-input"
+                          className="font-mono"
+                          type="password"
+                        />
+                      </div>
+                    )}
+                  </div>
+                </>
+              );
+            }
+          })()}
           {transportType === "stdio" && (
             <div className="space-y-2">
               <Button
@@ -452,13 +510,10 @@ const Sidebar = ({
               <div className="grid grid-cols-2 gap-4">
                 <Button
                   data-testid="connect-button"
-                  onClick={() => {
-                    onDisconnect();
-                    onConnect();
-                  }}
+                  onClick={connect}
                 >
                   <RotateCcw className="w-4 h-4 mr-2" />
-                  {transportType === "stdio" ? "Restart" : "Reconnect"}
+                  {getConnectButtonText()}
                 </Button>
                 <Button onClick={onDisconnect}>
                   <RefreshCwOff className="w-4 h-4 mr-2" />
@@ -467,9 +522,9 @@ const Sidebar = ({
               </div>
             )}
             {connectionStatus !== "connected" && (
-              <Button className="w-full" onClick={onConnect}>
+              <Button className="w-full" onClick={connect}>
                 <Play className="w-4 h-4 mr-2" />
-                Connect
+                {getConnectButtonText()}
               </Button>
             )}
 
