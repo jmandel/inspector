@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback, useRef } from "react";
 import {
   Play,
   ChevronDown,
@@ -12,6 +12,8 @@ import {
   Settings,
   HelpCircle,
   RefreshCwOff,
+  Loader2,
+  X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,7 +38,277 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from "@/components/ui/tooltip";
-import { IntraBrowserConfigPanel } from "./Sidebar/IntraBrowserConfigPanel";
+import { IntraBrowserClientTransport, UiCallbacks, SetupError, ServerSetupRequirements } from "../../../../src/IntraBrowserTransport";
+import { useToast } from "@/hooks/use-toast";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Trash2 } from "lucide-react";
+
+// --- New Setup Modal Helper (Protocol v2.0) ---
+
+/** Represents the messages sent from the setup iframe */
+interface SetupResultMessage {
+    type: 'SERVER_SETUP_COMPLETE' | 'SERVER_SETUP_ABORT';
+    success: boolean;
+    code?: 'USER_CANCELED' | 'FAILED';
+    reason?: string;
+}
+
+/**
+ * Opens a modal iframe for the provider setup process (Protocol v2.0).
+ * Resolves when the iframe posts SERVER_SETUP_COMPLETE.
+ * Rejects if the iframe posts SERVER_SETUP_ABORT or on error.
+ */
+export async function setupModal(serverUrl: string): Promise<void> {
+  let urlObj: URL;
+  try {
+    urlObj = new URL(serverUrl);
+  } catch (e) {
+    throw new Error(`Invalid server URL: ${serverUrl}`);
+  }
+  urlObj.searchParams.set('phase', 'setup');
+  urlObj.searchParams.set('client', location.origin);
+
+  return new Promise<void>((resolve, reject) => {
+    console.log(`[setupModal] Opening setup modal for: ${urlObj.toString()}`);
+    // 1 – overlay
+    const overlay = document.createElement('div');
+    overlay.style.cssText =
+      'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.7);display:flex;' +
+      'align-items:center;justify-content:center;';
+    document.body.appendChild(overlay);
+
+    // Optional: Close button on overlay
+    const closeButton = document.createElement('button');
+    closeButton.textContent = '✕';
+    closeButton.style.cssText = 'position:absolute;top:20px;right:20px;background:none;border:none;font-size:1.5em;color:white;cursor:pointer;';
+    closeButton.onclick = () => {
+        console.log("[setupModal] Aborted by user clicking overlay close button.");
+        cleanup(false, new Error('USER_CANCELED'));
+    };
+    overlay.appendChild(closeButton);
+
+    // 2 – iframe
+    const frame = document.createElement('iframe');
+    frame.style.cssText = 'width:min(90%, 800px);height:min(90%, 600px);border:0;border-radius:8px;background:white;'; // Added background
+    frame.src = urlObj.toString();
+    overlay.appendChild(frame);
+
+    // 3 – listen
+    function handler(ev: MessageEvent) {
+      // Validate source and origin
+      if (ev.source !== frame.contentWindow || ev.origin !== urlObj.origin)
+        return;
+
+       const data = ev.data as SetupResultMessage;
+        console.log("[setupModal] Received message:", data);
+
+      switch (data?.type) {
+        case 'SERVER_SETUP_COMPLETE':
+          if (data.success === true) {
+              cleanup(true); // Resolve promise
+          } else {
+              console.warn("[setupModal] Received SERVER_SETUP_COMPLETE but success was not true.");
+              cleanup(false, new Error('Setup completed with unexpected success value'));
+          }
+          break;
+        case 'SERVER_SETUP_ABORT':
+           const errorCode = data.code || 'FAILED';
+           const reason = data.reason || errorCode;
+          cleanup(false, new Error(`${errorCode}: ${reason}`)); // Reject promise
+          break;
+      }
+    }
+    window.addEventListener('message', handler, false);
+
+    function cleanup(ok: boolean, err?: Error) {
+      console.log(`[setupModal] Cleaning up. Success: ${ok}`, err ? `Error: ${err.message}`: '');
+      window.removeEventListener('message', handler);
+      if (overlay.parentNode) {
+          overlay.remove();
+      }
+      ok ? resolve() : reject(err);
+    }
+
+    // Handle iframe load errors
+    frame.onerror = (event) => {
+         console.error("[setupModal] Iframe failed to load:", event);
+         cleanup(false, new Error(`Setup iframe failed to load for ${urlObj.origin}. Check URL and network.`));
+    };
+     frame.onload = () => {
+         console.log("[setupModal] Iframe loaded.");
+         // Check if contentWindow is accessible (might fail cross-origin)
+         if (!frame.contentWindow) {
+             console.error("[setupModal] Iframe contentWindow is inaccessible after load.");
+             cleanup(false, new Error("Setup iframe context is inaccessible."));
+         }
+     };
+
+  });
+}
+
+// --- End Setup Modal Helper ---
+
+
+// --- Simplified IntraBrowserSetupPanel Component (Protocol v2.0) ---
+
+interface IntraBrowserSetupPanelProps {
+  configuredProviders: string[];
+  addConfiguredProvider: (url: string) => void;
+  removeConfiguredProvider: (url: string) => void;
+  selectedProviderUrl: string;
+  setSelectedProviderUrl: (url: string) => void;
+  isConnected: boolean;
+  onDisconnectClick: () => void;
+}
+
+const IntraBrowserSetupPanel: React.FC<IntraBrowserSetupPanelProps> = ({
+  configuredProviders,
+  addConfiguredProvider,
+  removeConfiguredProvider,
+  selectedProviderUrl,
+  setSelectedProviderUrl,
+  isConnected,
+  onDisconnectClick
+}) => {
+  const [providerUrlToAdd, setProviderUrlToAdd] = useState("");
+  const [isAddingProvider, setIsAddingProvider] = useState(false); // For spinner
+  const { toast } = useToast();
+
+  const handleAddProvider = useCallback(async () => {
+    const url = providerUrlToAdd.trim();
+    if (!url) {
+        toast({ title: "Error", description: "Please enter a provider URL.", variant: "destructive" });
+        return;
+    }
+    // Basic URL validation
+    try {
+        new URL(url);
+    } catch {
+        toast({ title: "Error", description: "Invalid provider URL format.", variant: "destructive" });
+        return;
+    }
+
+    setIsAddingProvider(true);
+    try {
+        await setupModal(url);
+        addConfiguredProvider(url);
+        toast({ title: "Provider Added", description: `${new URL(url).hostname} is ready to connect.` });
+        setProviderUrlToAdd(""); // Clear input on success
+    } catch (err) {
+         console.error("[SetupPanel] Setup modal failed:", err);
+         const errorMsg = err instanceof Error ? err.message : String(err);
+         // Don't show redundant toast if user cancelled
+         if (!errorMsg.startsWith('USER_CANCELED')) {
+             toast({ title: "Setup Failed", description: errorMsg, variant: "destructive" });
+         }
+    } finally {
+        setIsAddingProvider(false);
+    }
+  }, [providerUrlToAdd, addConfiguredProvider, toast]);
+
+  const handleReconfigure = useCallback(async (url: string) => {
+      if (!url) return;
+      console.log(`[SetupPanel] Reconfiguring provider: ${url}`);
+      setIsAddingProvider(true); // Reuse loading state maybe?
+      try {
+          await setupModal(url);
+          toast({ title: "Reconfiguration Complete", description: `${new URL(url).hostname} reconfigured successfully.` });
+      } catch (err) {
+          console.error("[SetupPanel] Reconfiguration failed:", err);
+          const errorMsg = err instanceof Error ? err.message : String(err);
+          if (!errorMsg.startsWith('USER_CANCELED')) {
+              toast({ title: "Reconfiguration Failed", description: errorMsg, variant: "destructive" });
+          }
+      } finally {
+          setIsAddingProvider(false);
+      }
+  }, [toast]);
+
+  const handleRemoveProvider = (url: string) => {
+    removeConfiguredProvider(url);
+    toast({ title: "Provider Removed", description: `${new URL(url).hostname} removed.` });
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Add New Provider Section */}
+      <div className="space-y-2 border-b pb-4 mb-4 border-border">
+        <label className="text-sm font-medium" htmlFor="provider-url-input">
+          Add New Provider URL
+        </label>
+        <Input
+          id="provider-url-input"
+          placeholder="https://provider.example.com/tool.html"
+          value={providerUrlToAdd}
+          onChange={(e) => setProviderUrlToAdd(e.target.value)}
+          disabled={isAddingProvider}
+          className="font-mono"
+        />
+        <Button onClick={handleAddProvider} disabled={isAddingProvider || !providerUrlToAdd} className="w-full">
+          {isAddingProvider && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+          Add / Configure Provider
+        </Button>
+         {isAddingProvider && (
+             <Alert variant="default" className="mt-2">
+                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                 <AlertTitle>Setup in Progress</AlertTitle>
+                 <AlertDescription>Complete the steps in the setup panel...</AlertDescription>
+             </Alert>
+        )}
+      </div>
+
+      {/* Select/Connect/Remove Configured Provider Section */}
+      <div className="space-y-2">
+         <label className="text-sm font-medium" htmlFor="configured-provider-select">
+            Connect to Configured Provider
+        </label>
+        {configuredProviders.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No configured providers yet. Add one above.</p>
+        ) : (
+          <div className="space-y-2 mt-2 max-h-60 overflow-y-auto border rounded p-2">
+            {configuredProviders.map(url => (
+              <div key={url} className="flex items-center justify-between gap-2 p-1 hover:bg-accent rounded">
+                <span
+                  className={`text-sm truncate flex-grow cursor-pointer ${selectedProviderUrl === url ? 'font-semibold' : ''}`}
+                  title={url}
+                  onClick={() => setSelectedProviderUrl(url)}
+                >
+                  {url}
+                </span>
+                <div className="flex-shrink-0 space-x-1">
+                  <Button
+                     variant="ghost"
+                     size="icon"
+                     className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                     onClick={() => handleReconfigure(url)}
+                     disabled={isAddingProvider || (isConnected && selectedProviderUrl === url)}
+                     aria-label={`Reconfigure ${url}`}
+                     title={`Reconfigure ${url}`}
+                  >
+                      <Settings className="h-4 w-4" />
+                  </Button>
+                   <Button
+                     variant="ghost"
+                     size="icon"
+                     className="h-7 w-7 text-destructive hover:bg-destructive/10"
+                     onClick={() => handleRemoveProvider(url)}
+                     aria-label={`Remove ${url}`}
+                     title={`Remove ${url}`}
+                   >
+                     <Trash2 className="h-4 w-4" />
+                   </Button>
+                 </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// --- End IntraBrowserSetupPanel Component ---
+
 
 interface SidebarProps {
   connectionStatus: ConnectionStatus;
@@ -54,7 +326,7 @@ interface SidebarProps {
   setBearerToken: (token: string) => void;
   headerName?: string;
   setHeaderName?: (name: string) => void;
-  onConnect: () => void;
+  onConnect: (providerUrl?: string) => void;
   onDisconnect: () => void;
   stdErrNotifications: StdErrNotification[];
   clearStdErrNotifications: () => void;
@@ -63,8 +335,11 @@ interface SidebarProps {
   loggingSupported: boolean;
   config: InspectorConfig;
   setConfig: (config: InspectorConfig) => void;
-  // For intra-browser transport
-  onIntraBrowserConnect?: (targetUrl: string, targetOrigin: string) => void;
+  configuredProviders: string[];
+  addConfiguredProvider: (url: string) => void;
+  removeConfiguredProvider: (url: string) => void;
+  selectedProviderUrl: string;
+  setSelectedProviderUrl: (url: string) => void;
 }
 
 const Sidebar = ({
@@ -92,46 +367,70 @@ const Sidebar = ({
   loggingSupported,
   config,
   setConfig,
-  onIntraBrowserConnect,
+  configuredProviders,
+  addConfiguredProvider,
+  removeConfiguredProvider,
+  selectedProviderUrl,
+  setSelectedProviderUrl,
 }: SidebarProps) => {
   const [theme, setTheme] = useTheme();
   const [showEnvVars, setShowEnvVars] = useState(false);
   const [showBearerToken, setShowBearerToken] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
   const [shownEnvVars, setShownEnvVars] = useState<Set<string>>(new Set());
+  const { toast } = useToast();
 
   const connect = () => {
-    const isConnected = connectionStatus === "connected";
-    if (isConnected) {
+    if (connectionStatus === "connected") {
+      console.log("[Sidebar] Reconnecting...");
       onDisconnect();
+      setTimeout(() => {
+         if (transportType === "intra-browser") {
+           if (selectedProviderUrl) {
+              console.log(`[Sidebar] Attempting to reconnect to selected provider: ${selectedProviderUrl}`);
+              onConnect(selectedProviderUrl);
+           } else {
+              console.warn("[Sidebar] Reconnect clicked for intra-browser, but no provider selected.");
+              toast({ title: "Cannot Reconnect", description: "No Intra-Browser provider selected.", variant: "destructive" });
+           }
+         } else {
+           console.log(`[Sidebar] Attempting to reconnect for ${transportType}...`);
+           onConnect();
+         }
+      }, 100);
       return;
     }
 
-    // For IntraBrowserTransport, use the globally registered connect handler
-    if (transportType === "intra-browser") {
-      if (window.MCP_INSPECTOR_API?.connectIntraBrowserTransport) {
-        window.MCP_INSPECTOR_API.connectIntraBrowserTransport();
-      } else {
-        console.error("IntraBrowserTransport connect handler not registered");
-      }
-      return;
+    if (connectionStatus === "disconnected" || connectionStatus === "error" || connectionStatus === "error-connecting-to-proxy") {
+        if (transportType === "intra-browser") {
+          if (selectedProviderUrl) {
+            console.log(`[Sidebar] Attempting to connect to selected provider: ${selectedProviderUrl}`);
+            onConnect(selectedProviderUrl);
+          } else {
+            console.warn("[Sidebar] Connect clicked for intra-browser, but no provider selected.");
+            toast({ title: "Cannot Connect", description: "No Intra-Browser provider selected.", variant: "destructive" });
+          }
+        } else {
+          console.log(`[Sidebar] Attempting to connect for ${transportType}...`);
+          onConnect();
+        }
     }
-
-    // For other transport types, use the onConnect prop directly
-    onConnect();
   };
 
-  // At the bottom of the sidebar, add logic to handle the Connect button text
   const getConnectButtonText = () => {
     if (connectionStatus === "connected") {
       return "Reconnect";
     }
-    
-    if (transportType === "intra-browser") {
-      return "Connect to IntraBrowserTransport";
-    }
-    
     return "Connect";
+  };
+
+  const isConnectDisabled = () => {
+      if (connectionStatus === 'connecting') return true;
+      if (connectionStatus === 'connected') return false;
+      if (transportType === 'intra-browser' && !selectedProviderUrl) {
+          return true;
+      }
+      return false;
   };
 
   return (
@@ -158,6 +457,7 @@ const Sidebar = ({
               onValueChange={(value: "stdio" | "sse" | "streamable-http" | "intra-browser") =>
                 setTransportType(value)
               }
+              disabled={connectionStatus === 'connecting' || connectionStatus === 'connected'}
             >
               <SelectTrigger id="transport-type-select">
                 <SelectValue placeholder="Select transport type" />
@@ -166,23 +466,25 @@ const Sidebar = ({
                 <SelectItem value="stdio">STDIO</SelectItem>
                 <SelectItem value="sse">SSE</SelectItem>
                 <SelectItem value="streamable-http">Streamable HTTP</SelectItem>
-                <SelectItem value="intra-browser">IntraBrowserTransport</SelectItem>
+                <SelectItem value="intra-browser">postMessage</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
           {(() => {
             const isConnected = connectionStatus === "connected";
-            
+            const isConnecting = connectionStatus === "connecting";
+
             if (transportType === "intra-browser") {
               return (
-                <IntraBrowserConfigPanel 
-                  onConnect={(targetUrl, targetOrigin) => 
-                    onIntraBrowserConnect && onIntraBrowserConnect(targetUrl, targetOrigin)
-                  }
-                  onDisconnect={onDisconnect}
-                  isConnected={isConnected}
-                  isConnecting={false}
+                <IntraBrowserSetupPanel
+                    configuredProviders={configuredProviders}
+                    addConfiguredProvider={addConfiguredProvider}
+                    removeConfiguredProvider={removeConfiguredProvider}
+                    selectedProviderUrl={selectedProviderUrl}
+                    setSelectedProviderUrl={setSelectedProviderUrl}
+                    isConnected={isConnected}
+                    onDisconnectClick={onDisconnect}
                 />
               );
             } else if (transportType === "stdio") {
@@ -198,6 +500,7 @@ const Sidebar = ({
                       value={command}
                       onChange={(e) => setCommand(e.target.value)}
                       className="font-mono"
+                      disabled={isConnected || isConnecting}
                     />
                   </div>
                   <div className="space-y-2">
@@ -213,6 +516,7 @@ const Sidebar = ({
                       value={args}
                       onChange={(e) => setArgs(e.target.value)}
                       className="font-mono"
+                      disabled={isConnected || isConnecting}
                     />
                   </div>
                 </>
@@ -230,6 +534,7 @@ const Sidebar = ({
                       value={sseUrl}
                       onChange={(e) => setSseUrl(e.target.value)}
                       className="font-mono"
+                      disabled={isConnected || isConnecting}
                     />
                   </div>
                   <div className="space-y-2">
@@ -239,6 +544,7 @@ const Sidebar = ({
                       className="flex items-center w-full"
                       data-testid="auth-button"
                       aria-expanded={showBearerToken}
+                       disabled={isConnected || isConnecting}
                     >
                       {showBearerToken ? (
                         <ChevronDown className="w-4 h-4 mr-2" />
@@ -258,6 +564,7 @@ const Sidebar = ({
                           data-testid="header-input"
                           className="font-mono"
                           value={headerName}
+                          disabled={isConnected || isConnecting}
                         />
                         <label
                           className="text-sm font-medium"
@@ -273,6 +580,7 @@ const Sidebar = ({
                           data-testid="bearer-token-input"
                           className="font-mono"
                           type="password"
+                          disabled={isConnected || isConnecting}
                         />
                       </div>
                     )}
@@ -289,12 +597,9 @@ const Sidebar = ({
                 className="flex items-center w-full"
                 data-testid="env-vars-button"
                 aria-expanded={showEnvVars}
+                disabled={connectionStatus === 'connected' || connectionStatus === 'connecting'}
               >
-                {showEnvVars ? (
-                  <ChevronDown className="w-4 h-4 mr-2" />
-                ) : (
-                  <ChevronRight className="w-4 h-4 mr-2" />
-                )}
+                {showEnvVars ? <ChevronDown className="w-4 h-4 mr-2" /> : <ChevronRight className="w-4 h-4 mr-2" />}
                 Environment Variables
               </Button>
               {showEnvVars && (
@@ -330,6 +635,7 @@ const Sidebar = ({
                             });
                           }}
                           className="font-mono"
+                          disabled={connectionStatus === 'connected' || connectionStatus === 'connecting'}
                         />
                         <Button
                           variant="destructive"
@@ -340,6 +646,7 @@ const Sidebar = ({
                             const { [key]: _removed, ...rest } = env;
                             setEnv(rest);
                           }}
+                          disabled={connectionStatus === 'connected' || connectionStatus === 'connecting'}
                         >
                           ×
                         </Button>
@@ -356,6 +663,7 @@ const Sidebar = ({
                             setEnv(newEnv);
                           }}
                           className="font-mono"
+                          disabled={connectionStatus === 'connected' || connectionStatus === 'connecting'}
                         />
                         <Button
                           variant="outline"
@@ -379,6 +687,7 @@ const Sidebar = ({
                           title={
                             shownEnvVars.has(key) ? "Hide value" : "Show value"
                           }
+                          disabled={connectionStatus === 'connected' || connectionStatus === 'connecting'}
                         >
                           {shownEnvVars.has(key) ? (
                             <Eye className="h-4 w-4" aria-hidden="true" />
@@ -398,6 +707,7 @@ const Sidebar = ({
                       newEnv[key] = "";
                       setEnv(newEnv);
                     }}
+                     disabled={connectionStatus === 'connected' || connectionStatus === 'connecting'}
                   >
                     Add Environment Variable
                   </Button>
@@ -406,7 +716,6 @@ const Sidebar = ({
             </div>
           )}
 
-          {/* Configuration */}
           <div className="space-y-2">
             <Button
               variant="outline"
@@ -415,11 +724,7 @@ const Sidebar = ({
               data-testid="config-button"
               aria-expanded={showConfig}
             >
-              {showConfig ? (
-                <ChevronDown className="w-4 h-4 mr-2" />
-              ) : (
-                <ChevronRight className="w-4 h-4 mr-2" />
-              )}
+              {showConfig ? <ChevronDown className="w-4 h-4 mr-2" /> : <ChevronRight className="w-4 h-4 mr-2" />}
               <Settings className="w-4 h-4 mr-2" />
               Configuration
             </Button>
@@ -505,116 +810,111 @@ const Sidebar = ({
             )}
           </div>
 
-          <div className="space-y-2">
-            {connectionStatus === "connected" && (
-              <div className="grid grid-cols-2 gap-4">
-                <Button
-                  data-testid="connect-button"
-                  onClick={connect}
-                >
-                  <RotateCcw className="w-4 h-4 mr-2" />
-                  {getConnectButtonText()}
-                </Button>
-                <Button onClick={onDisconnect}>
-                  <RefreshCwOff className="w-4 h-4 mr-2" />
-                  Disconnect
-                </Button>
-              </div>
-            )}
-            {connectionStatus !== "connected" && (
-              <Button className="w-full" onClick={connect}>
-                <Play className="w-4 h-4 mr-2" />
-                {getConnectButtonText()}
+          <div className="space-y-2 pt-4 border-t border-border">
+            {connectionStatus === "connected" ? (
+              <Button onClick={onDisconnect} variant="destructive" className="w-full">
+                <RefreshCwOff className="w-4 h-4 mr-2" />
+                Disconnect
               </Button>
+            ) : null}
+            {connectionStatus === "connecting" && (
+              <Button onClick={onDisconnect} variant="destructive" className="w-full">
+                <X className="w-4 h-4 mr-2" />
+                Cancel
+              </Button>
+            )}
+            {(connectionStatus === "disconnected" || connectionStatus === "error" || connectionStatus === "error-connecting-to-proxy") && (
+               <Button
+                 className="w-full"
+                 onClick={connect}
+                 disabled={isConnectDisabled()}
+               >
+                 <Play className="w-4 h-4 mr-2" />
+                 {getConnectButtonText()}
+               </Button>
             )}
 
             <div className="flex items-center justify-center space-x-2 mb-4">
               <div
                 className={`w-2 h-2 rounded-full ${(() => {
                   switch (connectionStatus) {
-                    case "connected":
-                      return "bg-green-500";
-                    case "error":
-                      return "bg-red-500";
-                    case "error-connecting-to-proxy":
-                      return "bg-red-500";
-                    default:
-                      return "bg-gray-500";
+                    case "connected": return "bg-green-500";
+                    case "connecting": return "bg-yellow-500";
+                    case "error": return "bg-red-500";
+                    case "error-connecting-to-proxy": return "bg-red-500";
+                    default: return "bg-gray-500";
                   }
                 })()}`}
               />
               <span className="text-sm text-gray-600">
                 {(() => {
                   switch (connectionStatus) {
-                    case "connected":
-                      return "Connected";
-                    case "error":
-                      return "Connection Error, is your MCP server running?";
-                    case "error-connecting-to-proxy":
-                      return "Error Connecting to MCP Inspector Proxy - Check Console logs";
-                    default:
-                      return "Disconnected";
+                    case "connected": return "Connected";
+                    case "connecting": return "Connecting...";
+                    case "error": return "Connection Error";
+                    case "error-connecting-to-proxy": return "Proxy Error";
+                    default: return "Disconnected";
                   }
                 })()}
               </span>
             </div>
 
             {loggingSupported && connectionStatus === "connected" && (
-              <div className="space-y-2">
-                <label
-                  className="text-sm font-medium"
-                  htmlFor="logging-level-select"
-                >
-                  Logging Level
-                </label>
-                <Select
-                  value={logLevel}
-                  onValueChange={(value: LoggingLevel) =>
-                    sendLogLevelRequest(value)
-                  }
-                >
-                  <SelectTrigger id="logging-level-select">
-                    <SelectValue placeholder="Select logging level" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {Object.values(LoggingLevelSchema.enum).map((level) => (
-                      <SelectItem key={level} value={level}>
-                        {level}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+               <div className="space-y-2">
+                 <label
+                   className="text-sm font-medium"
+                   htmlFor="logging-level-select"
+                 >
+                   Logging Level
+                 </label>
+                 <Select
+                   value={logLevel}
+                   onValueChange={(value: LoggingLevel) =>
+                     sendLogLevelRequest(value)
+                   }
+                 >
+                   <SelectTrigger id="logging-level-select">
+                     <SelectValue placeholder="Select logging level" />
+                   </SelectTrigger>
+                   <SelectContent>
+                     {Object.values(LoggingLevelSchema.enum).map((level) => (
+                       <SelectItem key={level} value={level}>
+                         {level}
+                       </SelectItem>
+                     ))}
+                   </SelectContent>
+                 </Select>
+               </div>
             )}
 
             {stdErrNotifications.length > 0 && (
-              <>
-                <div className="mt-4 border-t border-gray-200 pt-4">
-                  <div className="flex justify-between items-center">
-                    <h3 className="text-sm font-medium">
-                      Error output from MCP server
-                    </h3>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={clearStdErrNotifications}
-                      className="h-8 px-2"
-                    >
-                      Clear
-                    </Button>
-                  </div>
-                  <div className="mt-2 max-h-80 overflow-y-auto">
-                    {stdErrNotifications.map((notification, index) => (
-                      <div
-                        key={index}
-                        className="text-sm text-red-500 font-mono py-2 border-b border-gray-200 last:border-b-0"
-                      >
-                        {notification.params.content}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </>
+               <>
+                 <div className="mt-4 border-t border-gray-200 pt-4">
+                   <div className="flex justify-between items-center">
+                     <h3 className="text-sm font-medium">
+                       Error output from MCP server
+                     </h3>
+                     <Button
+                       variant="outline"
+                       size="sm"
+                       onClick={clearStdErrNotifications}
+                       className="h-8 px-2"
+                     >
+                       Clear
+                     </Button>
+                   </div>
+                   <div className="mt-2 max-h-80 overflow-y-auto">
+                     {stdErrNotifications.map((notification, index) => (
+                       <div
+                         key={index}
+                         className="text-sm text-red-500 font-mono py-2 border-b border-gray-200 last:border-b-0"
+                       >
+                         {notification.params.content}
+                       </div>
+                     ))}
+                   </div>
+                 </div>
+               </>
             )}
           </div>
         </div>

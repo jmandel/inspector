@@ -28,6 +28,7 @@ import {
 import { useConnection } from "./lib/hooks/useConnection";
 import { useDraggablePane } from "./lib/hooks/useDraggablePane";
 import { StdErrNotification } from "./lib/notificationTypes";
+// import { IntraBrowserClientTransport, UiCallbacks, SetupError } from "@jmandel/ehr-mcp/src/IntraBrowserTransport"; // Not directly used here anymore
 
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -53,8 +54,10 @@ import ToolsTab from "./components/ToolsTab";
 import { DEFAULT_INSPECTOR_CONFIG } from "./lib/constants";
 import { InspectorConfig } from "./lib/configurationTypes";
 import { getMCPProxyAddress } from "./utils/configUtils";
+import { useToast } from "@/hooks/use-toast";
 
 const CONFIG_LOCAL_STORAGE_KEY = "inspectorConfig_v1";
+const CONFIGURED_PROVIDERS_LOCAL_STORAGE_KEY = "configuredIntraBrowserProviders_v1";
 
 const App = () => {
   const [resources, setResources] = useState<Resource[]>([]);
@@ -163,12 +166,21 @@ const App = () => {
   const progressTokenRef = useRef(0);
 
   const { height: historyPaneHeight, handleDragStart } = useDraggablePane(300);
+  const { toast } = useToast();
 
-  const [intraBrowserOrigin, setIntraBrowserOrigin] = useState<string>("");
-  const intraBrowserTargetRef = useRef<HTMLIFrameElement | null>(null);
-  const [intraBrowserWindow, setIntraBrowserWindow] = useState<Window | null>(
-    null,
-  );
+  // --- State for Intra-browser Setup ---
+  const [configuredProviders, setConfiguredProviders] = useState<string[]>(() => {
+    const saved = localStorage.getItem(CONFIGURED_PROVIDERS_LOCAL_STORAGE_KEY);
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [selectedProviderUrl, setSelectedProviderUrl] = useState<string>("");
+  // State to track if the user explicitly clicked disconnect
+  // const [didManuallyDisconnect, setDidManuallyDisconnect] = useState<boolean>(false); // <-- REMOVED (No longer needed for this logic)
+  // --- End Intra-browser Setup State ---
+
+  // Intra-browser transport parameters - now set dynamically before connecting
+  // const [intraBrowserOrigin, setIntraBrowserOrigin] = useState<string>(""); // <-- REMOVED
+  // const [intraBrowserSrc, setIntraBrowserSrc] = useState<string>(""); // <-- REMOVED
 
   const {
     connectionStatus,
@@ -203,8 +215,8 @@ const App = () => {
         { id: nextRequestId.current++, request, resolve, reject },
       ]);
     },
-    targetWindow: intraBrowserWindow || undefined,
-    targetOrigin: intraBrowserOrigin,
+    // iframeSrc: intraBrowserSrc || undefined, // <-- REMOVED
+    // targetOrigin: intraBrowserOrigin, // <-- REMOVED
   });
 
   useEffect(() => {
@@ -235,13 +247,21 @@ const App = () => {
     localStorage.setItem(CONFIG_LOCAL_STORAGE_KEY, JSON.stringify(config));
   }, [config]);
 
+  // Persist configured providers
+  useEffect(() => {
+    localStorage.setItem(CONFIGURED_PROVIDERS_LOCAL_STORAGE_KEY, JSON.stringify(configuredProviders));
+  }, [configuredProviders]);
+
+  // --- REMOVED Refactored Effects for Intra-browser Connection ---
+  // Effect 1 and Effect 2 are no longer needed here.
+
   const onOAuthConnect = useCallback(
     (serverUrl: string) => {
       setSseUrl(serverUrl);
       setTransportType("sse");
-      void connectMcpServer();
+      void connectMcpServer(); // Call without URL for non-intra-browser
     },
-    [connectMcpServer],
+    [connectMcpServer], // Removed dependencies related to intra-browser state
   );
 
   useEffect(() => {
@@ -259,7 +279,7 @@ const App = () => {
       .catch((error) =>
         console.error("Error fetching default environment:", error),
       );
-  }, []);
+  }, [config]); // Added config dependency
 
   useEffect(() => {
     rootsRef.current = roots;
@@ -397,7 +417,7 @@ const App = () => {
       ListPromptsResultSchema,
       "prompts",
     );
-    setPrompts(response.prompts);
+    setPrompts(prompts.concat(response.prompts ?? [])); // Concat for pagination
     setNextPromptCursor(response.nextCursor);
   };
 
@@ -422,7 +442,7 @@ const App = () => {
       ListToolsResultSchema,
       "tools",
     );
-    setTools(response.tools);
+    setTools(tools.concat(response.tools ?? [])); // Concat for pagination
     setNextToolCursor(response.nextCursor);
   };
 
@@ -476,122 +496,11 @@ const App = () => {
     setStdErrNotifications([]);
   };
 
-  // Disconnect handler that tears down the intra-browser iframe completely
+  // Disconnect handler simplified
   const handleDisconnect = useCallback(async () => {
-    // For intra-browser: clear window reference and remove iframe *before* we signal disconnect
-    if (transportType === "intra-browser") {
-      // Clear the stored window reference immediately to prevent auto-reconnect race
-      setIntraBrowserWindow(null);
-
-      if (intraBrowserTargetRef.current && intraBrowserTargetRef.current.parentNode) {
-        console.log("[App] Removing intra-browser iframe on disconnect");
-        intraBrowserTargetRef.current.parentNode.removeChild(intraBrowserTargetRef.current);
-        intraBrowserTargetRef.current = null;
-      }
-    }
-
-    // Now close the MCP client/transport
+    // setDidManuallyDisconnect(true); // No longer needed here
     await disconnectMcpServer();
-  }, [disconnectMcpServer, transportType]);
-
-  const handleIntraBrowserConnect = useCallback((src: string, origin: string) => {
-    setIntraBrowserOrigin(origin);
-    
-    // Track if we need to wait for iframe load
-    let needToWaitForLoad = false;
-    
-    // Create a new iframe element if it doesn't exist
-    if (!intraBrowserTargetRef.current) {
-      console.log("[App] Creating new iframe for IntraBrowser transport");
-      
-      const iframe = document.createElement('iframe');
-      iframe.style.width = '0';
-      iframe.style.height = '0';
-      iframe.style.border = 'none';
-      iframe.style.position = 'absolute';
-      iframe.style.opacity = '0';
-      
-      // Important: Store the iframe reference BEFORE setting src
-      // This ensures the reference is available when onload fires
-      intraBrowserTargetRef.current = iframe;
-      document.body.appendChild(iframe);
-      
-      needToWaitForLoad = true;
-      
-      // Set the onload handler before setting src to avoid race conditions
-      iframe.onload = () => {
-        console.log("[App] Iframe loaded, now connecting...");
-        // Add a short delay to ensure DOM is fully ready
-        setTimeout(() => {
-          if (intraBrowserTargetRef.current?.contentWindow) {
-            console.log("[App] Iframe contentWindow available, storing window reference");
-            setIntraBrowserWindow(intraBrowserTargetRef.current.contentWindow);
-          } else {
-            console.error("[App] Iframe contentWindow not available after load!");
-          }
-        }, 100);
-      };
-      
-      // Set src last to avoid missing the load event
-      iframe.src = src;
-    } else {
-      // Only update src if it has changed to avoid reload
-      const iframe = intraBrowserTargetRef.current;
-      if (iframe.src !== src) {
-        console.log("[App] Updating iframe src (will cause reload)");
-        
-        // Set the onload handler before changing src
-        iframe.onload = () => {
-          console.log("[App] Iframe reloaded, now connecting...");
-          // Add a short delay to ensure DOM is fully ready
-          setTimeout(() => {
-            if (intraBrowserTargetRef.current?.contentWindow) {
-              console.log("[App] Iframe contentWindow available after reload, storing window reference");
-              setIntraBrowserWindow(intraBrowserTargetRef.current.contentWindow);
-            } else {
-              console.error("[App] Iframe contentWindow not available after reload!");
-            }
-          }, 100);
-        };
-        
-        needToWaitForLoad = true;
-        iframe.src = src;
-      } else {
-        console.log("[App] Reusing existing iframe with same src");
-        needToWaitForLoad = false;
-      }
-    }
-    
-    // Connect immediately if we don't need to wait for load
-    if (!needToWaitForLoad) {
-      console.log("[App] Iframe already loaded, connecting immediately");
-      if (intraBrowserTargetRef.current?.contentWindow) {
-        setIntraBrowserWindow(intraBrowserTargetRef.current.contentWindow);
-      } else {
-        console.error("[App] Iframe exists but contentWindow is not available!");
-      }
-    }
-  }, [connectMcpServer]);
-
-  // Automatically connect once the iframe window reference is ready and we are disconnected
-  useEffect(() => {
-    if (
-      transportType === "intra-browser" &&
-      intraBrowserWindow &&
-      connectionStatus === "disconnected"
-    ) {
-      console.log("[App] Detected ready iframe window, initiating connection...");
-      connectMcpServer();
-    }
-  }, [transportType, intraBrowserWindow, connectionStatus, connectMcpServer]);
-
-  useEffect(() => {
-    return () => {
-      if (intraBrowserTargetRef.current && intraBrowserTargetRef.current.parentNode) {
-        intraBrowserTargetRef.current.parentNode.removeChild(intraBrowserTargetRef.current);
-      }
-    };
-  }, []);
+  }, [disconnectMcpServer]);
 
   if (window.location.pathname === "/oauth/callback") {
     const OAuthCallback = lazy(
@@ -624,6 +533,7 @@ const App = () => {
         setBearerToken={setBearerToken}
         headerName={headerName}
         setHeaderName={setHeaderName}
+        // Pass connectMcpServer directly for all connection attempts initiated by Sidebar
         onConnect={connectMcpServer}
         onDisconnect={handleDisconnect}
         stdErrNotifications={stdErrNotifications}
@@ -631,7 +541,20 @@ const App = () => {
         sendLogLevelRequest={sendLogLevelRequest}
         loggingSupported={!!serverCapabilities?.logging || false}
         clearStdErrNotifications={clearStdErrNotifications}
-        onIntraBrowserConnect={handleIntraBrowserConnect}
+        configuredProviders={configuredProviders}
+        addConfiguredProvider={(url) => {
+          setConfiguredProviders(prev => [...new Set([...prev, url])]); // Ensure unique
+          setSelectedProviderUrl(url);
+        }}
+        removeConfiguredProvider={(urlToRemove) => {
+          setConfiguredProviders(prev => prev.filter(url => url !== urlToRemove));
+          if (selectedProviderUrl === urlToRemove) {
+              setSelectedProviderUrl(""); // Clear selection if the removed one was selected
+          }
+        }}
+        selectedProviderUrl={selectedProviderUrl}
+        setSelectedProviderUrl={setSelectedProviderUrl}
+        // connectIntraBrowserProvider={(url) => setSelectedProviderUrl(url)} // <-- REMOVED Prop
       />
       <div className="flex-1 flex flex-col overflow-hidden">
         <div className="flex-1 overflow-auto">
@@ -831,7 +754,9 @@ const App = () => {
           ) : (
             <div className="flex items-center justify-center h-full">
               <p className="text-lg text-gray-500">
-                Connect to an MCP server to start inspecting
+                {transportType === 'intra-browser'
+                 ? "Select or add an Intra-Browser provider to connect"
+                 : "Connect to an MCP server to start inspecting"}
               </p>
             </div>
           )}

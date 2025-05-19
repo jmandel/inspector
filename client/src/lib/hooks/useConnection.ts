@@ -1,5 +1,11 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { IntraBrowserClientTransport } from "../transports/IntraBrowserTransport";
+import {
+  SSEClientTransport,
+  SseError,
+} from "@modelcontextprotocol/sdk/client/sse.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { IntraBrowserClientTransport } from "../../index.js"
+import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   ClientNotification,
   ClientRequest,
@@ -20,11 +26,12 @@ import {
   Progress,
 } from "@modelcontextprotocol/sdk/types.js";
 import { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { useToast } from "@/hooks/use-toast";
 import { z } from "zod";
 import { ConnectionStatus } from "../constants";
 import { Notification, StdErrNotificationSchema } from "../notificationTypes";
+import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { InspectorOAuthClientProvider } from "../auth";
 import packageJson from "../../../package.json";
 import {
@@ -34,6 +41,10 @@ import {
 } from "@/utils/configUtils";
 import { getMCPServerRequestTimeout } from "@/utils/configUtils";
 import { InspectorConfig } from "../configurationTypes";
+import {
+  CreateMessageRequestSchema,
+  ListRootsRequestSchema
+} from "@modelcontextprotocol/sdk/types.js";
 
 interface UseConnectionOptions {
   transportType: "stdio" | "sse" | "streamable-http" | "intra-browser";
@@ -41,13 +52,17 @@ interface UseConnectionOptions {
   args: string;
   sseUrl: string;
   env: Record<string, string>;
+  bearerToken?: string;
+  headerName?: string;
   config: InspectorConfig;
   onNotification?: (notification: Notification) => void;
   onStdErrNotification?: (notification: Notification) => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onPendingRequest?: (request: any, resolve: any, reject: any) => void;
-  targetWindow?: Window;
-  targetOrigin?: string;
+  // iframeSrc?: string; <-- REMOVED
+  // targetOrigin?: string; <-- REMOVED
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  getRoots?: () => any[];
 }
 
 export function useConnection({
@@ -56,12 +71,15 @@ export function useConnection({
   args,
   sseUrl,
   env,
+  bearerToken,
+  headerName,
   config,
   onNotification,
   onStdErrNotification,
   onPendingRequest,
-  targetWindow,
-  targetOrigin,
+  // iframeSrc, <-- REMOVED
+  // targetOrigin, <-- REMOVED
+  getRoots,
 }: UseConnectionOptions) {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("disconnected");
@@ -73,6 +91,7 @@ export function useConnection({
     { request: string; response?: string }[]
   >([]);
   const [completionsSupported, setCompletionsSupported] = useState(true);
+  const pendingTransportRef = useRef<Transport | null>(null);
 
   const pushHistory = (request: object, response?: object) => {
     setRequestHistory((prev) => [
@@ -235,7 +254,27 @@ export function useConnection({
     }
   };
 
-  const connect = async (_e?: unknown) => {
+  const handleAuthError = async (error: unknown) => {
+    if (error instanceof SseError && error.code === 401) {
+      // Create a new auth provider with the current server URL
+      const serverAuthProvider = new InspectorOAuthClientProvider(sseUrl);
+
+      const result = await auth(serverAuthProvider, { serverUrl: sseUrl });
+      return result === "AUTHORIZED";
+    }
+
+    return false;
+  };
+
+  // Modified connect signature to accept optional providerUrl
+  const connect = async (providerUrl?: string, retryCount: number = 0) => {
+    // Clear previous client/state if any
+    if (mcpClient) {
+      await disconnect();
+    }
+    setConnectionStatus("connecting");
+    pendingTransportRef.current = null;
+
     const client = new Client<Request, Notification, Result>(
       {
         name: "mcp-inspector",
@@ -251,13 +290,20 @@ export function useConnection({
       },
     );
 
+    let transport: Transport | null = null;
+
     try {
-      // Set to error first to clear any previous state
-      setConnectionStatus("disconnected" as ConnectionStatus);
+      // Proxy health check...
+      try {
+        await checkProxyHealth();
+      } catch {
+        if (transportType !== "intra-browser") {
+           setConnectionStatus("error-connecting-to-proxy");
+           return;
+        }
+      }
 
-      await checkProxyHealth();
-
-      // Register notification handlers
+      // Register notification handlers...
       if (onNotification) {
         [
           CancelledNotificationSchema,
@@ -285,55 +331,26 @@ export function useConnection({
         );
       }
 
+      // Create Transport based on type
       if (transportType === "intra-browser") {
-        if (!targetWindow || !targetOrigin) {
-          throw new Error("Target window and origin required for intra-browser transport");
+        if (!providerUrl) {
+          throw new Error("providerUrl is required for intra-browser transport connection attempt.");
         }
-        
-        const transport = new IntraBrowserClientTransport(
-          targetWindow, 
-          targetOrigin
-        );
-        
-        // First log that we're about to initialize
-        console.log("[useConnection] About to connect IntraBrowserClientTransport and send initialize");
-        
-        // Connect to the transport
-        await client.connect(transport);
-        
-        // Set client and status
-        setMcpClient(client);
-        setConnectionStatus("connected" as ConnectionStatus);
-        
-        // Set server capabilities
-        const capabilities = client.getServerCapabilities();
-        setServerCapabilities(capabilities as ServerCapabilities);
-        
-        // Always send an explicit initialize request once connected
-        console.log("[useConnection] Sending explicit initialize request after connect...");
-
-        const initRequest: ClientRequest = {
-          method: "initialize" as const,
-          params: {},
-        } as unknown as ClientRequest;
-
+        let iframeSrc: string;
+        let targetOrigin: string;
         try {
-          const initResponse = await client.request(initRequest, z.any());
-
-          pushHistory(initRequest, initResponse);
-
-          if (initResponse?.capabilities) {
-            setServerCapabilities(initResponse.capabilities as ServerCapabilities);
-          }
-        } catch (err) {
-          console.error("[useConnection] Initialize request failed:", err);
+          const url = new URL(providerUrl);
+          iframeSrc = url.toString();
+          targetOrigin = url.origin;
+        } catch (e) {
+          throw new Error(`Invalid provider URL: ${providerUrl}`);
         }
-        
-        console.log("[useConnection] Successfully connected IntraBrowserClientTransport");
-        
-          return;
+        console.log("[useConnection] Creating IntraBrowserClientTransport with:", { iframeSrc, targetOrigin });
+        transport = new IntraBrowserClientTransport(iframeSrc, targetOrigin);
+        pendingTransportRef.current = transport;
+        console.log("[useConnection] IntraBrowserClientTransport instance created:", transport);
       } else {
-        // For SSE, StreamableHTTP, and stdio transports
+        // Logic for stdio, sse, streamable-http transport creation...
         let mcpProxyServerUrl: URL;
         switch (transportType) {
           case "stdio":
@@ -342,46 +359,155 @@ export function useConnection({
             mcpProxyServerUrl.searchParams.append("args", args);
             mcpProxyServerUrl.searchParams.append("env", JSON.stringify(env));
             break;
-
           case "sse":
             mcpProxyServerUrl = new URL(`${getMCPProxyAddress(config)}/sse`);
             mcpProxyServerUrl.searchParams.append("url", sseUrl);
             break;
-
           case "streamable-http":
             mcpProxyServerUrl = new URL(`${getMCPProxyAddress(config)}/mcp`);
             mcpProxyServerUrl.searchParams.append("url", sseUrl);
             break;
-            
           default:
             throw new Error(`Unsupported transport type: ${transportType}`);
         }
-        
-        mcpProxyServerUrl.searchParams.append(
-          "transportType",
-          transportType
-        );
-      
-        try {
-          // Inject auth manually for SSE and streamable-http transports
-          // ... existing code for auth handling
-        } catch (error) {
-          // ... existing error handling
+        mcpProxyServerUrl.searchParams.append("transportType", transportType);
+
+        const headers: HeadersInit = {};
+        const serverAuthProvider = new InspectorOAuthClientProvider(sseUrl);
+        const token = bearerToken || (await serverAuthProvider.tokens())?.access_token;
+        if (token) {
+          const authHeaderName = headerName || "Authorization";
+          headers[authHeaderName] = `Bearer ${token}`;
         }
+
+        const transportOptions = {
+          eventSourceInit: { fetch: (url: string | URL | globalThis.Request, init: RequestInit | undefined) => fetch(url, { ...init, headers }) },
+          requestInit: { headers },
+        };
+
+        transport = transportType === "streamable-http"
+          ? new StreamableHTTPClientTransport(mcpProxyServerUrl, { sessionId: undefined })
+          : new SSEClientTransport(mcpProxyServerUrl, transportOptions);
+        pendingTransportRef.current = transport;
       }
-    } catch (e) {
-      // ... existing error handling
+
+      // Connect using the created transport
+      if (!transport) {
+        throw new Error("Transport creation failed.");
+      }
+
+      console.log(`[useConnection] Calling client.connect(transport) for ${transportType}...`);
+      await client.connect(transport);
+      pendingTransportRef.current = null;
+      console.log(`[useConnection] client.connect(transport) returned successfully for ${transportType}.`);
+
+      setMcpClient(client);
+      setConnectionStatus("connected");
+      setCompletionsSupported(true);
+
+      // Get and set server capabilities
+      const capabilities = client.getServerCapabilities();
+      setServerCapabilities(capabilities as ServerCapabilities);
+
+      // If intra-browser, send explicit initialize request *after* connect succeeds
+      if (transportType === "intra-browser") {
+            console.log("[useConnection] Sending explicit initialize request after connect...");
+            const initRequest: ClientRequest = {
+              method: "initialize" as const,
+              params: {
+                 protocolVersion: "2025-03-26",
+                 capabilities: { roots: { listChanged: true } },
+                 clientInfo: { name: "Inspector", version: packageJson.version }
+               },
+            } as unknown as ClientRequest;
+
+            try {
+              const initResponse = await client.request(initRequest, z.any());
+              pushHistory(initRequest, initResponse);
+              if (initResponse?.capabilities) {
+                 // Update capabilities again if server sends different ones in initialize response
+                 setServerCapabilities(initResponse.capabilities as ServerCapabilities);
+              }
+            } catch (err) {
+              console.error("[useConnection] Explicit Initialize request failed:", err);
+              // Decide if this is fatal? Maybe just log and continue.
+            }
+             console.log("[useConnection] Successfully connected IntraBrowserClientTransport");
+      } else {
+            // Log the implicit initialize for other transports
+            pushHistory({ method: "initialize" }, {
+              capabilities,
+              serverInfo: client.getServerVersion(),
+              instructions: client.getInstructions(),
+            });
+      }
+
+      // Register request handlers (if provided) *after* connection
+      if (onPendingRequest) {
+        client.setRequestHandler(CreateMessageRequestSchema, (request) => {
+          return new Promise((resolve, reject) => {
+            onPendingRequest(request, resolve, reject);
+          });
+        });
+      }
+      if (getRoots) {
+        client.setRequestHandler(ListRootsRequestSchema, async () => {
+          return { roots: getRoots() };
+        });
+      }
+
+    } catch (error) {
+      pendingTransportRef.current = null;
+      console.error(`[useConnection] Connection failed for ${transportType}:`, error);
+
+      // Handle auth errors specifically for SSE/StreamableHTTP
+      if (transportType === "sse" || transportType === "streamable-http") {
+          const shouldRetry = await handleAuthError(error);
+          if (shouldRetry) {
+            // Recursively call connect (pass providerUrl if it was intra-browser originally)
+            return connect(transportType === "intra-browser" ? providerUrl : undefined, retryCount + 1);
+          }
+          if (error instanceof SseError && error.code === 401) {
+            setConnectionStatus("disconnected");
+            return;
+          }
+      }
+
+      // For general errors or auth errors we don't retry
+      toast({ title: "Connection Error", description: error instanceof Error ? error.message : String(error), variant: "destructive" });
+      setConnectionStatus("error");
+      await transport?.close().catch(e => console.warn("Error closing transport after connection failure:", e));
+
     }
   };
 
   const disconnect = async () => {
-    await mcpClient?.close();
-    const authProvider = new InspectorOAuthClientProvider(sseUrl);
-    authProvider.clear();
-    setMcpClient(null);
-    setConnectionStatus("disconnected" as ConnectionStatus);
+    const currentStatus = connectionStatus;
+    const transportToClose = pendingTransportRef.current;
+    pendingTransportRef.current = null;
+
+    console.log(`[useConnection] disconnect called. Status: ${currentStatus}`);
+
+    if (mcpClient) {
+        console.log("[useConnection] Closing established MCP client...");
+        await mcpClient.close().catch(e => console.warn("Error closing MCP client:", e));
+        setMcpClient(null);
+    }
+
+    if (currentStatus === "connecting" && transportToClose) {
+        console.log("[useConnection] Closing pending transport explicitly...");
+        await transportToClose.close().catch(e => console.warn("Error closing pending transport:", e));
+    }
+
+    if (transportType === "sse" || transportType === "streamable-http") {
+        const authProvider = new InspectorOAuthClientProvider(sseUrl);
+        authProvider.clear();
+    }
+
+    setConnectionStatus("disconnected");
     setCompletionsSupported(false);
     setServerCapabilities(null);
+    console.log("[useConnection] Disconnect completed.");
   };
 
   return {

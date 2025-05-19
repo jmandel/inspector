@@ -5,4 +5,4 @@ export { default as App } from './App';
 export { 
   IntraBrowserClientTransport, 
   IntraBrowserServerTransport 
-} from './lib/transports/IntraBrowserTransport'; 
+} from '@jmandel/ehr-mcp/src/IntraBrowserTransport'; 
